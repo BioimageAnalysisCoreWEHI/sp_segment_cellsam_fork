@@ -35,14 +35,27 @@ def has_valid_ome_xml(tif):
     In both cases rewriting would destroy information that mesmer-segment
     reads natively, so the file should be passed through unchanged.
     """
+    def _xml_has_channels_and_physical_size(xml_str):
+        """Return True if XML has Channel elements AND PhysicalSizeX/Y on Pixels."""
+        try:
+            root = ET.fromstring(xml_str)
+            has_channels = any(
+                _local_tag_name(e.tag) == "Channel" for e in root.iter()
+            )
+            has_physical_size = any(
+                _local_tag_name(e.tag) == "Pixels"
+                and e.get("PhysicalSizeX") is not None
+                and e.get("PhysicalSizeY") is not None
+                for e in root.iter()
+            )
+            return has_channels and has_physical_size
+        except ET.ParseError:
+            return False
+
     try:
         ome_xml = tif.ome_metadata
-        if ome_xml:
-            root = ET.fromstring(ome_xml)
-            # Check there is at least one Channel element
-            for elem in root.iter():
-                if _local_tag_name(elem.tag) == "Channel":
-                    return True
+        if ome_xml and _xml_has_channels_and_physical_size(ome_xml):
+            return True
     except Exception:
         pass
 
@@ -50,13 +63,8 @@ def has_valid_ome_xml(tif):
     if tif.pages:
         desc = tif.pages[0].description
         if desc:
-            try:
-                root = ET.fromstring(desc)
-                for elem in root.iter():
-                    if _local_tag_name(elem.tag) == "Channel":
-                        return True
-            except ET.ParseError:
-                pass
+            if _xml_has_channels_and_physical_size(desc):
+                return True
 
             # MIBI TIFFs: per-page JSON with channel.target
             try:
@@ -129,9 +137,28 @@ def get_channel_names(tif, n_channels):
 
 def get_resolution(tif):
     """
-    Try to extract pixel size in microns from ImageJ or TIFF resolution tags.
+    Try to extract pixel size in microns from OME-XML, ImageJ, or TIFF resolution tags.
     Returns (physical_size, unit) or (None, None).
     """
+    # Try OME-XML PhysicalSizeX first
+    try:
+        ome_xml = tif.ome_metadata
+        if not ome_xml and tif.pages:
+            desc_tag = tif.pages[0].tags.get("ImageDescription")
+            ome_xml = desc_tag.value if desc_tag else tif.pages[0].description
+        if ome_xml:
+            root = ET.fromstring(ome_xml)
+            for elem in root.iter():
+                if _local_tag_name(elem.tag) == "Pixels":
+                    px = elem.get("PhysicalSizeX")
+                    if px is not None:
+                        try:
+                            return float(px), "µm"
+                        except (ValueError, TypeError):
+                            pass
+    except Exception:
+        pass
+
     # Try ImageJ metadata for pixel size
     if hasattr(tif, "imagej_metadata") and tif.imagej_metadata:
         ij = tif.imagej_metadata
@@ -187,6 +214,13 @@ def main():
         n_channels = data.shape[0] if data.ndim == 3 else 1
         channel_names = get_channel_names(tif, n_channels)
         physical_size, _ = get_resolution(tif)
+
+    if physical_size is None:
+        physical_size = 1.0
+        print(
+            "Warning: no physical pixel size found in metadata, defaulting to 1.0 µm/pixel",
+            file=sys.stderr,
+        )
 
     print(
         f"Converting to OME-TIFF with channels: {channel_names}",
